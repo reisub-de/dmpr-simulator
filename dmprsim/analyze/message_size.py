@@ -9,14 +9,18 @@ from pathlib import Path
 
 import functools
 import matplotlib
+import pandas as pd
+
+#matplotlib.use('AGG')
+
 import matplotlib.pyplot as plt
+
+matplotlib.style.use('ggplot')
+
 import numpy as np
 
 from dmprsim.analyze._utils.process_messages import process_files
 from dmprsim.scenarios.message_size import MessageSizeScenario
-
-matplotlib.use('AGG')
-matplotlib.style.use('ggplot')
 
 configs = {
     'density': {
@@ -43,7 +47,7 @@ configs = {
     'size': {
         'label': "Network size",
         'datapoints': {
-            i: "{} Nodes".format(i**2) for i in (
+            i: "{} Nodes".format(i ** 2) for i in (
             1,
             2,
             3,
@@ -77,6 +81,14 @@ configs = {
     },
 }
 
+MAX = ('Maximum', np.max)
+P90 = ('90% Percentile', functools.partial(np.percentile, q=90))
+P75 = ('75% Percentile', functools.partial(np.percentile, q=75))
+P25 = ('75% Percentile', functools.partial(np.percentile, q=25))
+AVG = ('Average', np.average)
+MEDIAN = ('Median', np.median)
+MIN = ('Minimum', np.min)
+
 # compression options: 'none', 'zlib', 'lzma
 PLOTS = {
     'density': (
@@ -84,13 +96,13 @@ PLOTS = {
             'interval': '*',
             'loss': '*',
             'actions': ['zlib', 'len'],
-            'options': ['max', 'p75', 'avg', 'median', 'p25', 'min'],
+            'options': [MAX, P75, AVG, MEDIAN, P25, MIN],
         }),
         ('interval', {
             'loss': '*',
             'size': '*',
             'actions': ['zlib', 'len'],
-            'options': ['p75', 'avg', 'median', 'p25'],
+            'options': [P75, AVG, MEDIAN, P25],
         }),
     ),
     'loss': (
@@ -98,41 +110,27 @@ PLOTS = {
             'density': '*',
             'size': '*',
             'actions': ['zlib', 'len'],
-            'options': ['p75', 'avg', 'median', 'p25']
+            'options': [P75, AVG, MEDIAN, P25]
         }),
     ),
+    'interval': (
+        ('size', {
+            'loss': '*',
+            'density': '*',
+            'actions': ['zlib', 'len'],
+            'options': [MAX, P90, P75, AVG, MEDIAN]
+        }),
+        # ('size', {
+        #     'loss': '*',
+        #     'density': '*',
+        #     'actions': ['zlib', 'len'],
+        #     'type': 'histogram',
+        #     'options': [],
+        # }),
+    )
 }
 
 logger = logging.getLogger(__name__)
-
-
-class Accumulator(object):
-    def __init__(self):
-        self.data = {
-            'max': ([], np.max),
-            'min': ([], np.min),
-            'avg': ([], np.average),
-            'median': ([], np.median),
-            'p75': ([], functools.partial(np.percentile, q=75)),
-            'p25': ([], functools.partial(np.percentile, q=25)),
-        }
-        self.x = []
-        self.labels = {
-            'max': "Maximum",
-            'min': "Minimum",
-            'avg': "Average",
-            'median': "Median",
-            'p75': "75% Percentile",
-            'p25': "25% Percentile",
-        }
-
-    def add(self, x, data):
-        self.x.append(x)
-        for l, func in self.data.values():
-            l.append(func(data))
-
-    def __bool__(self):
-        return bool(self.x)
 
 
 def accumulate(input: Path, globs: dict, filename: str) -> np.array:
@@ -158,17 +156,17 @@ def accumulate(input: Path, globs: dict, filename: str) -> np.array:
         logger.debug("File lengths of {} is zero, skipping".format(files))
         return
 
-    return sizes
+    return pd.Series(sizes)
 
 
 def plot(chartgroup: str, chartgroup_datapoint: int, xaxis: str,
-         data: Accumulator, output: str, options: list):
+         data: list, output: str, options: list):
     """
     plot the data with a defined chartgroup and xaxis with title, labels and
     a legend into the output directory with the filename
     chartgroup-chartgroup_datapoint-xaxis
     """
-    x = data.x
+    x, data = zip(*data)
     if xaxis == 'size':
         x = [i ** 2 for i in x]
 
@@ -182,15 +180,32 @@ def plot(chartgroup: str, chartgroup_datapoint: int, xaxis: str,
     # Fill the space between minimum and maximum
     # ax.fill_between(x, mins, maxs, color=((0.16, 0.5, 0.725, 0.31),))
 
-    for option in options:
-        d = data.data[option][0]
-        label = data.labels[option]
-        ax.plot(x, d, label=label)
+    for label, func in options:
+        ax.plot(x, [func(d) for d in data], label=label)
 
     ax.legend()
 
     fig.savefig(output, dpi=300)
+    plt.close(fig)
 
+
+def histogram(chartgroup: str, chartgroup_datapoint: int, xaxis: str,
+              data: list, output: Path, options: list, filename: str):
+    for x, d in data:
+        fig = plt.figure()
+        ax = fig.add_subplot(1, 1, 1)
+        ax.hist(d, bins=50)
+
+        plot_filename = "histogram-{}-{}-{}-{}-{}.png".format(chartgroup,
+                                                    chartgroup_datapoint, xaxis,
+                                                    x, filename)
+        fig.savefig(str(output / plot_filename), dpi=300)
+
+        plt.close(fig)
+
+def testplot(dataframe):
+    dataframe.agg(['median', 'max']).plot.line()
+    plt.show()
 
 def generate_plots(input: Path, output: Path, filename: str, chartgroup: str,
                    xaxis: str, globs: dict):
@@ -201,7 +216,8 @@ def generate_plots(input: Path, output: Path, filename: str, chartgroup: str,
         pass
     for chartgroup_datapoint in configs[chartgroup]['datapoints']:
         globs[chartgroup] = chartgroup_datapoint
-        cumulated_data = Accumulator()
+        cumulated_data = []
+        test = {}
 
         # Parse all datafiles for the specified x-axis
         for xaxis_datapoint in configs[xaxis]['datapoints']:
@@ -209,7 +225,8 @@ def generate_plots(input: Path, output: Path, filename: str, chartgroup: str,
             data = accumulate(input, globs, filename)
             if data is None:
                 continue
-            cumulated_data.add(xaxis_datapoint, data)
+            cumulated_data.append((xaxis_datapoint, data))
+            test[xaxis_datapoint] = data
 
         if not cumulated_data:
             logger.debug(
@@ -217,11 +234,18 @@ def generate_plots(input: Path, output: Path, filename: str, chartgroup: str,
                                                      xaxis))
             continue
 
-        plot_filename = "{}-{}-{}-{}.png".format(chartgroup,
-                                                 chartgroup_datapoint,
-                                                 xaxis, filename)
-        plot(chartgroup, chartgroup_datapoint, xaxis, cumulated_data,
-             str(output / plot_filename), globs['options'])
+        type_ = globs.get('type', 'linechart')
+        if type_ == 'linechart':
+            plot_filename = "linechart-{}-{}-{}-{}.png".format(chartgroup,
+                                                     chartgroup_datapoint,
+                                                     xaxis, filename)
+            plot(chartgroup, chartgroup_datapoint, xaxis, cumulated_data,
+                 str(output / plot_filename), globs['options'])
+        elif type_ == 'histogram':
+            histogram(chartgroup, chartgroup_datapoint, xaxis, cumulated_data,
+                      output, globs['options'], filename)
+
+        testplot(pd.DataFrame(test))
 
 
 def run_scenario(args: object, results_dir: Path, scenario_dir: Path):
