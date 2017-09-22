@@ -7,6 +7,7 @@ import logging
 import multiprocessing
 from pathlib import Path
 
+import functools
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -42,7 +43,7 @@ configs = {
     'size': {
         'label': "Network size",
         'datapoints': {
-            i: "{} Nodes".format(i) for i in (
+            i: "{} Nodes".format(i**2) for i in (
             1,
             2,
             3,
@@ -79,24 +80,65 @@ configs = {
 # compression options: 'none', 'zlib', 'lzma
 PLOTS = {
     'density': (
-        ('size', {'interval': '*', 'loss': '*', 'actions': ['zlib', 'len']}),
-        ('size', {'interval': '*', 'loss': '*', 'actions':
-            ['reduce', 'zlib', 'len']}),
-        ('interval', {'loss': '*', 'size': '*', 'actions': ['zlib', 'len']}),
+        ('size', {
+            'interval': '*',
+            'loss': '*',
+            'actions': ['zlib', 'len'],
+            'options': ['max', 'p75', 'avg', 'median', 'p25', 'min'],
+        }),
+        ('interval', {
+            'loss': '*',
+            'size': '*',
+            'actions': ['zlib', 'len'],
+            'options': ['p75', 'avg', 'median', 'p25'],
+        }),
     ),
     'loss': (
-        ('interval', {'density': '*', 'size': '*', 'actions': ['zlib', 'len']}),
+        ('interval', {
+            'density': '*',
+            'size': '*',
+            'actions': ['zlib', 'len'],
+            'options': ['p75', 'avg', 'median', 'p25']
+        }),
     ),
 }
 
 logger = logging.getLogger(__name__)
 
 
-def accumulate(input: Path, globs: dict, filename: str,
-               xaxis_datapoint: int) -> np.array:
+class Accumulator(object):
+    def __init__(self):
+        self.data = {
+            'max': ([], np.max),
+            'min': ([], np.min),
+            'avg': ([], np.average),
+            'median': ([], np.median),
+            'p75': ([], functools.partial(np.percentile, q=75)),
+            'p25': ([], functools.partial(np.percentile, q=25)),
+        }
+        self.x = []
+        self.labels = {
+            'max': "Maximum",
+            'min': "Minimum",
+            'avg': "Average",
+            'median': "Median",
+            'p75': "75% Percentile",
+            'p25': "25% Percentile",
+        }
+
+    def add(self, x, data):
+        self.x.append(x)
+        for l, func in self.data.values():
+            l.append(func(data))
+
+    def __bool__(self):
+        return bool(self.x)
+
+
+def accumulate(input: Path, globs: dict, filename: str) -> np.array:
     """
     for `glob`/filename in input directory, accumulate the message lengths
-    and return a tuple with (x, min, perc25, avg, perc75, max)
+    and return a numpy array
     """
     files = '{size}-{density}-{loss}-{interval}/{filename}'.format(
         filename=filename, **globs)
@@ -114,20 +156,22 @@ def accumulate(input: Path, globs: dict, filename: str,
     sizes = np.asarray([int(i) for i in message_lengths.splitlines() if i])
     if len(sizes) == 0:
         logger.debug("File lengths of {} is zero, skipping".format(files))
-        return False
+        return
 
-    return (xaxis_datapoint, np.min(sizes), np.percentile(sizes, 25),
-            np.average(sizes), np.percentile(sizes, 75), np.max(sizes))
+    return sizes
 
 
-def plot(chartgroup: str, chartgroup_datapoint: int, xaxis: str, data: list,
-         output: str):
+def plot(chartgroup: str, chartgroup_datapoint: int, xaxis: str,
+         data: Accumulator, output: str, options: list):
     """
     plot the data with a defined chartgroup and xaxis with title, labels and
     a legend into the output directory with the filename
     chartgroup-chartgroup_datapoint-xaxis
     """
-    x, mins, perc25, avg, perc75, maxs = zip(*data)
+    x = data.x
+    if xaxis == 'size':
+        x = [i ** 2 for i in x]
+
     fig = plt.figure()
     ax = fig.add_subplot(1, 1, 1)
 
@@ -136,13 +180,12 @@ def plot(chartgroup: str, chartgroup_datapoint: int, xaxis: str, data: list,
     ax.set_title(configs[chartgroup]['datapoints'][chartgroup_datapoint])
 
     # Fill the space between minimum and maximum
-    ax.fill_between(x, mins, maxs, color=((0.16, 0.5, 0.725, 0.31),))
+    # ax.fill_between(x, mins, maxs, color=((0.16, 0.5, 0.725, 0.31),))
 
-    ax.plot(x, maxs, label="Maximum")
-    ax.plot(x, perc75, label="75% Percentile")
-    ax.plot(x, avg, label="Average")
-    ax.plot(x, perc25, label="25% Percentile")
-    ax.plot(x, mins, label="Minimum")
+    for option in options:
+        d = data.data[option][0]
+        label = data.labels[option]
+        ax.plot(x, d, label=label)
 
     ax.legend()
 
@@ -158,15 +201,15 @@ def generate_plots(input: Path, output: Path, filename: str, chartgroup: str,
         pass
     for chartgroup_datapoint in configs[chartgroup]['datapoints']:
         globs[chartgroup] = chartgroup_datapoint
-        cumulated_data = []
+        cumulated_data = Accumulator()
 
         # Parse all datafiles for the specified x-axis
         for xaxis_datapoint in configs[xaxis]['datapoints']:
             globs[xaxis] = xaxis_datapoint
-            data = accumulate(input, globs, filename, xaxis_datapoint)
-            if not data:
+            data = accumulate(input, globs, filename)
+            if data is None:
                 continue
-            cumulated_data.append(data)
+            cumulated_data.add(xaxis_datapoint, data)
 
         if not cumulated_data:
             logger.debug(
@@ -178,7 +221,7 @@ def generate_plots(input: Path, output: Path, filename: str, chartgroup: str,
                                                  chartgroup_datapoint,
                                                  xaxis, filename)
         plot(chartgroup, chartgroup_datapoint, xaxis, cumulated_data,
-             str(output / plot_filename))
+             str(output / plot_filename), globs['options'])
 
 
 def run_scenario(args: object, results_dir: Path, scenario_dir: Path):
@@ -206,10 +249,10 @@ def process_messages(path: Path, result_file: str, actions: list):
     all_ = len(dirs)
     cur = 0
     for _ in pool.imap_unordered(_process_message_worker,
-        ((dir, result_file, actions) for dir in dirs),
-        chunksize = 20):
+                                 ((dir, result_file, actions) for dir in dirs),
+                                 chunksize=20):
         cur += 1
-        logger.info('{:.2%} done'.format(cur/all_))
+        logger.info('{:.2%} done'.format(cur / all_))
     pool.close()
     pool.join()
 
